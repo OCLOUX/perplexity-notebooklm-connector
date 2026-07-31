@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """
-Serveur MCP HTTP pour NotebookLM - Compatible Perplexity Desktop v4
-Spec MCP 2024-11-05 / JSON-RPC 2.0 strict
-- GET /mcp : JSON si sondage, SSE si Accept: text/event-stream
-- Routes OAuth discovery incluses
+Serveur MCP HTTP pour NotebookLM - Compatible Perplexity Desktop v5
+Spec MCP 2025-06-18 / JSON-RPC 2.0 strict
 """
 import json
 import os
@@ -13,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 PORT = int(os.environ.get("MCP_PORT", 3000))
 HOST = os.environ.get("MCP_HOST", "0.0.0.0")
+PROTOCOL_VERSION = "2025-06-18"
 
 TOOLS = [
     {
@@ -59,7 +58,7 @@ WELL_KNOWN_OAUTH = {
 
 SERVER_INFO = {
     "name": "notebooklm-mcp",
-    "version": "4.0.0",
+    "version": "5.0.0",
     "description": "Serveur MCP NotebookLM pour Perplexity Desktop",
     "tools": [t["name"] for t in TOOLS],
 }
@@ -163,11 +162,10 @@ class MCPHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        path = self.path.split("?")[0]  # ignorer query string
+        path = self.path.split("?")[0]
         accept = self.headers.get("Accept", "")
         print(f"[MCP] GET {path} Accept={accept}", flush=True)
 
-        # Routes OAuth discovery
         if path in (
             "/.well-known/oauth-protected-resource",
             "/mcp/.well-known/oauth-protected-resource",
@@ -177,18 +175,15 @@ class MCPHandler(BaseHTTPRequestHandler):
             json_resp(self, WELL_KNOWN_OAUTH)
             return
 
-        # Endpoint MCP principal
         if path in ("/mcp", "/mcp/sse", "/sse", "/"):
-            # Si le client demande explicitement SSE -> streaming
             if "text/event-stream" in accept:
                 sse_resp(self)
             else:
-                # Sinon sondage de validation -> JSON
                 json_resp(self, SERVER_INFO)
             return
 
         if path == "/health":
-            json_resp(self, {"ok": True, "server": "notebooklm-mcp", "version": "4.0.0"})
+            json_resp(self, {"ok": True, "server": "notebooklm-mcp", "version": "5.0.0"})
             return
 
         print(f"[MCP] GET 404: {path}", flush=True)
@@ -198,7 +193,7 @@ class MCPHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
-        print(f"[MCP] POST {self.path}: {body[:300]}", flush=True)
+        print(f"[MCP] POST {self.path}: {body[:400]}", flush=True)
         try:
             msg = json.loads(body)
         except Exception:
@@ -207,24 +202,32 @@ class MCPHandler(BaseHTTPRequestHandler):
             return
 
         method = msg.get("method", "")
-        req_id = msg.get("id")
+        req_id = msg.get("id")  # peut etre 0 (entier) ou None
         params = msg.get("params") or {}
 
-        # Notifications -> HTTP 202 sans body
-        if req_id is None or method.startswith("notifications/"):
+        # Notifications : id absent ou method notifications/*
+        # ATTENTION: id=0 est valide (entier zero), seul None est une notification
+        is_notification = (req_id is None) or method.startswith("notifications/")
+        if is_notification:
             print(f"[MCP] Notification: {method}", flush=True)
             self.send_response(202)
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             return
 
+        # Echo du protocolVersion envoye par le client
+        client_protocol = params.get("protocolVersion", PROTOCOL_VERSION)
+
         if method == "initialize":
             resp = {
                 "jsonrpc": "2.0", "id": req_id,
                 "result": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": {"name": "notebooklm-mcp", "version": "4.0.0"},
+                    "protocolVersion": client_protocol,
+                    "capabilities": {
+                        "tools": {"listChanged": False},
+                        "logging": {},
+                    },
+                    "serverInfo": {"name": "notebooklm-mcp", "version": "5.0.0"},
                     "instructions": "Outils disponibles: list_notebooks, create_notebook, add_source_to_notebook.",
                 },
             }
@@ -253,7 +256,8 @@ class MCPHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"Serveur MCP NotebookLM v4 sur http://{HOST}:{PORT}/mcp", flush=True)
+    print(f"Serveur MCP NotebookLM v5 sur http://{HOST}:{PORT}/mcp", flush=True)
+    print(f"Protocole : {PROTOCOL_VERSION}", flush=True)
     print("Outils : list_notebooks, create_notebook, add_source_to_notebook", flush=True)
     print("Ctrl+C pour arreter.", flush=True)
     HTTPServer((HOST, PORT), MCPHandler).serve_forever()
