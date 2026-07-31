@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """
-Serveur MCP HTTP pour NotebookLM
-- Expose les outils MCP via HTTP Streaming (SSE)
-- Compatible Perplexity Desktop "HTTP diffusable en continu"
-- S'appuie sur le CLI nlm (notebooklm-mcp-cli)
+Serveur MCP HTTP pour NotebookLM - Compatible Perplexity Desktop
+Spec MCP 2024-11-05 / JSON-RPC 2.0 strict
 """
 import json
 import os
 import re
 import subprocess
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any
 
 PORT = int(os.environ.get("MCP_PORT", 3000))
 HOST = os.environ.get("MCP_HOST", "0.0.0.0")
@@ -23,27 +20,27 @@ TOOLS = [
     },
     {
         "name": "create_notebook",
-        "description": "Crée un notebook NotebookLM et y injecte un texte (réponse Perplexity).",
+        "description": "Cree un notebook NotebookLM et y injecte un texte (reponse Perplexity).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "title": {"type": "string", "description": "Titre du notebook"},
-                "text": {"type": "string", "description": "Contenu texte à injecter comme source"},
-                "source_title": {"type": "string", "description": "Titre de la source (défaut: Perplexity import)"},
-                "urls": {"type": "array", "items": {"type": "string"}, "description": "URLs supplémentaires à ajouter"},
+                "text": {"type": "string", "description": "Contenu texte a injecter comme source"},
+                "source_title": {"type": "string", "description": "Titre de la source (defaut: Perplexity import)"},
+                "urls": {"type": "array", "items": {"type": "string"}, "description": "URLs supplementaires"},
             },
             "required": ["title", "text"],
         },
     },
     {
         "name": "add_source_to_notebook",
-        "description": "Ajoute une source texte ou URL à un notebook existant.",
+        "description": "Ajoute une source texte ou URL a un notebook existant.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "notebook_id": {"type": "string", "description": "ID du notebook"},
-                "text": {"type": "string", "description": "Texte à ajouter"},
-                "url": {"type": "string", "description": "URL à ajouter"},
+                "text": {"type": "string", "description": "Texte a ajouter"},
+                "url": {"type": "string", "description": "URL a ajouter"},
                 "source_title": {"type": "string", "description": "Titre de la source"},
             },
             "required": ["notebook_id"],
@@ -52,7 +49,7 @@ TOOLS = [
 ]
 
 
-def run_nlm(args: list) -> dict:
+def run_nlm(args):
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     r = subprocess.run(
@@ -63,7 +60,7 @@ def run_nlm(args: list) -> dict:
     return {"stdout": r.stdout.strip(), "stderr": r.stderr.strip(), "returncode": r.returncode}
 
 
-def parse_notebook_id(output: str):
+def parse_notebook_id(output):
     for pat in [
         r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b",
         r"notebook(?:_id)?[\s:=]+([A-Za-z0-9_-]+)",
@@ -74,7 +71,7 @@ def parse_notebook_id(output: str):
     return None
 
 
-def call_tool(name: str, arguments: dict) -> Any:
+def call_tool(name, arguments):
     if name == "list_notebooks":
         result = run_nlm(["notebook", "list", "--json"])
         if result["returncode"] != 0:
@@ -85,15 +82,15 @@ def call_tool(name: str, arguments: dict) -> Any:
             return {"raw": result["stdout"]}
 
     elif name == "create_notebook":
-        title = arguments["title"]
-        text = arguments["text"]
+        title = arguments.get("title", "Notebook Perplexity")
+        text = arguments.get("text", "")
         source_title = arguments.get("source_title", "Perplexity import")
         urls = arguments.get("urls", [])
         r = run_nlm(["notebook", "create", title])
         out = r["stdout"] + "\n" + r["stderr"]
         notebook_id = parse_notebook_id(out)
         if not notebook_id:
-            return {"error": f"Impossible d'extraire l'ID du notebook. Sortie: {out}"}
+            return {"error": f"Impossible d'extraire l'ID. Sortie: {out}"}
         run_nlm(["source", "add", notebook_id, "--text", text, "--title", source_title])
         for url in urls:
             run_nlm(["source", "add", notebook_id, "--url", url])
@@ -104,7 +101,7 @@ def call_tool(name: str, arguments: dict) -> Any:
         }
 
     elif name == "add_source_to_notebook":
-        notebook_id = arguments["notebook_id"]
+        notebook_id = arguments.get("notebook_id")
         source_title = arguments.get("source_title", "Source import")
         if "text" in arguments:
             r = run_nlm(["source", "add", notebook_id, "--text", arguments["text"], "--title", source_title])
@@ -117,22 +114,27 @@ def call_tool(name: str, arguments: dict) -> Any:
     return {"error": f"Outil inconnu: {name}"}
 
 
-def make_sse(data: dict) -> bytes:
-    return f"data: {json.dumps(data)}\n\n".encode("utf-8")
+def json_resp(handler, data):
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    handler.send_response(200)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    handler.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Mcp-Session-Id")
+    handler.end_headers()
+    handler.wfile.write(body)
 
 
 class MCPHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        print(f"[MCP] {self.address_string()} - {format % args}", flush=True)
-
-    def cors(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept")
+    def log_message(self, fmt, *args):
+        print(f"[MCP] {self.address_string()} {fmt % args}", flush=True)
 
     def do_OPTIONS(self):
         self.send_response(200)
-        self.cors()
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Mcp-Session-Id")
         self.end_headers()
 
     def do_GET(self):
@@ -140,20 +142,18 @@ class MCPHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
-            self.cors()
+            self.send_header("Connection", "keep-alive")
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            self.wfile.write(make_sse({"jsonrpc": "2.0", "id": 1, "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "notebooklm-mcp", "version": "1.0.0"},
-            }}))
+            msg = json.dumps({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {}
+            })
+            self.wfile.write(f"data: {msg}\n\n".encode("utf-8"))
             self.wfile.flush()
         elif self.path == "/health":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.cors()
-            self.end_headers()
-            self.wfile.write(json.dumps({"ok": True}).encode())
+            json_resp(self, {"ok": True, "server": "notebooklm-mcp", "version": "2.0.0"})
         else:
             self.send_response(404)
             self.end_headers()
@@ -161,44 +161,65 @@ class MCPHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
+        print(f"[MCP] POST: {body[:300]}", flush=True)
         try:
-            req = json.loads(body)
+            msg = json.loads(body)
         except Exception:
             self.send_response(400)
             self.end_headers()
             return
 
-        method = req.get("method", "")
-        req_id = req.get("id")
-        params = req.get("params", {})
+        method = msg.get("method", "")
+        req_id = msg.get("id")  # None pour les notifications
+        params = msg.get("params") or {}
+
+        # Notifications (id=None ou method=notifications/*) : repondre 202, pas de body
+        if req_id is None or method.startswith("notifications/"):
+            print(f"[MCP] Notification: {method}", flush=True)
+            self.send_response(202)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            return
 
         if method == "initialize":
-            resp = {"jsonrpc": "2.0", "id": req_id, "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "notebooklm-mcp", "version": "1.0.0"},
-            }}
+            resp = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"tools": {"listChanged": False}},
+                    "serverInfo": {"name": "notebooklm-mcp", "version": "2.0.0"},
+                    "instructions": "Serveur MCP NotebookLM. Outils: list_notebooks, create_notebook, add_source_to_notebook.",
+                },
+            }
         elif method == "tools/list":
             resp = {"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}}
         elif method == "tools/call":
-            result = call_tool(params.get("name"), params.get("arguments", {}))
-            resp = {"jsonrpc": "2.0", "id": req_id, "result": {
-                "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}]
-            }}
+            tool_name = params.get("name", "")
+            arguments = params.get("arguments") or {}
+            result = call_tool(tool_name, arguments)
+            resp = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}],
+                    "isError": "error" in result,
+                },
+            }
         elif method == "ping":
             resp = {"jsonrpc": "2.0", "id": req_id, "result": {}}
         else:
-            resp = {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
+            resp = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32601, "message": f"Method not found: {method}"},
+            }
 
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.cors()
-        self.end_headers()
-        self.wfile.write(json.dumps(resp).encode("utf-8"))
+        json_resp(self, resp)
 
 
 if __name__ == "__main__":
-    print(f"Serveur MCP NotebookLM sur http://{HOST}:{PORT}/mcp", flush=True)
+    print(f"Serveur MCP NotebookLM v2 sur http://{HOST}:{PORT}/mcp", flush=True)
     print("Outils : list_notebooks, create_notebook, add_source_to_notebook", flush=True)
-    print("Ctrl+C pour arrêter.", flush=True)
+    print("Ctrl+C pour arreter.", flush=True)
     HTTPServer((HOST, PORT), MCPHandler).serve_forever()
