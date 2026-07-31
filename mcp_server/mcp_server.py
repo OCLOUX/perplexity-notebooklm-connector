@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Serveur MCP HTTP pour NotebookLM - Compatible Perplexity Desktop v7
+Serveur MCP HTTP pour NotebookLM - Compatible Perplexity Desktop v8
 Spec MCP 2025-06-18 / JSON-RPC 2.0 / HTTP 1.1
-Ajoute Mcp-Session-Id requis par la spec 2025-06-18
+- DELETE /mcp supporte (fermeture de session)
+- Sessions gerees en memoire
+- ConnectionAbortedError silencieux
 """
 import json
 import os
@@ -14,6 +16,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 PORT = int(os.environ.get("MCP_PORT", 3000))
 HOST = os.environ.get("MCP_HOST", "0.0.0.0")
 PROTOCOL_VERSION = "2025-06-18"
+
+SESSIONS = {}
 
 TOOLS = [
     {
@@ -60,7 +64,7 @@ WELL_KNOWN_OAUTH = {
 
 SERVER_INFO = {
     "name": "notebooklm-mcp",
-    "version": "7.0.0",
+    "version": "8.0.0",
     "description": "Serveur MCP NotebookLM pour Perplexity Desktop",
     "tools": [t["name"] for t in TOOLS],
 }
@@ -130,47 +134,70 @@ def call_tool(name, arguments):
 
 def send_json(handler, data, status=200, extra_headers=None):
     body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-    handler.send_response(status)
-    handler.send_header("Content-Type", "application/json")
-    handler.send_header("Content-Length", str(len(body)))
-    handler.send_header("Connection", "keep-alive")
-    handler.send_header("Access-Control-Allow-Origin", "*")
-    handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-    handler.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Mcp-Session-Id")
-    handler.send_header("Access-Control-Expose-Headers", "Mcp-Session-Id")
-    if extra_headers:
-        for k, v in extra_headers.items():
-            handler.send_header(k, v)
-    handler.end_headers()
-    handler.wfile.write(body)
+    try:
+        handler.send_response(status)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.send_header("Connection", "keep-alive")
+        handler.send_header("Access-Control-Allow-Origin", "*")
+        handler.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        handler.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Mcp-Session-Id")
+        handler.send_header("Access-Control-Expose-Headers", "Mcp-Session-Id")
+        if extra_headers:
+            for k, v in extra_headers.items():
+                handler.send_header(k, v)
+        handler.end_headers()
+        handler.wfile.write(body)
+        handler.wfile.flush()
+    except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError):
+        pass
 
 
 def send_sse(handler):
-    handler.send_response(200)
-    handler.send_header("Content-Type", "text/event-stream")
-    handler.send_header("Cache-Control", "no-cache")
-    handler.send_header("Connection", "keep-alive")
-    handler.send_header("Access-Control-Allow-Origin", "*")
-    handler.end_headers()
-    msg = json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
-    handler.wfile.write(f"data: {msg}\n\n".encode("utf-8"))
-    handler.wfile.flush()
+    try:
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream")
+        handler.send_header("Cache-Control", "no-cache")
+        handler.send_header("Connection", "keep-alive")
+        handler.send_header("Access-Control-Allow-Origin", "*")
+        handler.end_headers()
+        msg = json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+        handler.wfile.write(f"data: {msg}\n\n".encode("utf-8"))
+        handler.wfile.flush()
+    except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError):
+        pass
 
 
 class MCPHandler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"  # CRITIQUE : HTTP/1.1 obligatoire
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
         print(f"[MCP] {self.address_string()} {fmt % args}", flush=True)
 
     def do_OPTIONS(self):
-        self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Mcp-Session-Id")
-        self.send_header("Access-Control-Expose-Headers", "Mcp-Session-Id")
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        try:
+            self.send_response(200)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Mcp-Session-Id")
+            self.send_header("Access-Control-Expose-Headers", "Mcp-Session-Id")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        except (ConnectionAbortedError, BrokenPipeError):
+            pass
+
+    def do_DELETE(self):
+        session_id = self.headers.get("Mcp-Session-Id", "")
+        if session_id in SESSIONS:
+            del SESSIONS[session_id]
+        print(f"[MCP] DELETE session={session_id}", flush=True)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+        except (ConnectionAbortedError, BrokenPipeError):
+            pass
 
     def do_GET(self):
         path = self.path.split("?")[0]
@@ -194,14 +221,17 @@ class MCPHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/health":
-            send_json(self, {"ok": True, "server": "notebooklm-mcp", "version": "7.0.0"})
+            send_json(self, {"ok": True, "server": "notebooklm-mcp", "version": "8.0.0"})
             return
 
-        body = b"Not Found"
-        self.send_response(404)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            body = b"Not Found"
+            self.send_response(404)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (ConnectionAbortedError, BrokenPipeError):
+            pass
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -210,30 +240,37 @@ class MCPHandler(BaseHTTPRequestHandler):
         try:
             msg = json.loads(raw)
         except Exception:
-            err = b"Bad Request"
-            self.send_response(400)
-            self.send_header("Content-Length", str(len(err)))
-            self.end_headers()
-            self.wfile.write(err)
+            try:
+                err = b"Bad Request"
+                self.send_response(400)
+                self.send_header("Content-Length", str(len(err)))
+                self.end_headers()
+                self.wfile.write(err)
+            except (ConnectionAbortedError, BrokenPipeError):
+                pass
             return
 
         method = msg.get("method", "")
-        req_id = msg.get("id")  # 0 = requete valide, None = notification
+        req_id = msg.get("id")  # 0 = valide, None = notification
         params = msg.get("params") or {}
 
         is_notification = (req_id is None) or method.startswith("notifications/")
         if is_notification:
             print(f"[MCP] Notification: {method}", flush=True)
-            self.send_response(202)
-            self.send_header("Content-Length", "0")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
+            try:
+                self.send_response(202)
+                self.send_header("Content-Length", "0")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+            except (ConnectionAbortedError, BrokenPipeError):
+                pass
             return
 
         client_protocol = params.get("protocolVersion", PROTOCOL_VERSION)
-        session_id = str(uuid.uuid4())  # genere un session ID unique
 
         if method == "initialize":
+            session_id = str(uuid.uuid4())
+            SESSIONS[session_id] = True
             resp = {
                 "jsonrpc": "2.0", "id": req_id,
                 "result": {
@@ -242,11 +279,10 @@ class MCPHandler(BaseHTTPRequestHandler):
                         "tools": {"listChanged": False},
                         "logging": {},
                     },
-                    "serverInfo": {"name": "notebooklm-mcp", "version": "7.0.0"},
+                    "serverInfo": {"name": "notebooklm-mcp", "version": "8.0.0"},
                     "instructions": "Outils: list_notebooks, create_notebook, add_source_to_notebook.",
                 },
             }
-            # Spec 2025-06-18 : retourner Mcp-Session-Id dans la reponse initialize
             send_json(self, resp, extra_headers={"Mcp-Session-Id": session_id})
             return
 
@@ -275,7 +311,7 @@ class MCPHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"Serveur MCP NotebookLM v7 sur http://{HOST}:{PORT}/mcp", flush=True)
+    print(f"Serveur MCP NotebookLM v8 sur http://{HOST}:{PORT}/mcp", flush=True)
     print(f"Protocole : {PROTOCOL_VERSION} / HTTP/1.1", flush=True)
     print("Outils : list_notebooks, create_notebook, add_source_to_notebook", flush=True)
     print("Ctrl+C pour arreter.", flush=True)
