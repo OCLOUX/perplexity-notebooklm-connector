@@ -2,6 +2,7 @@
 """
 Serveur MCP HTTP pour NotebookLM - Compatible Perplexity Desktop
 Spec MCP 2024-11-05 / JSON-RPC 2.0 strict
+Inclut les routes OAuth discovery requises par Perplexity Desktop
 """
 import json
 import os
@@ -47,6 +48,13 @@ TOOLS = [
         },
     },
 ]
+
+WELL_KNOWN_OAUTH = {
+    "resource": "",
+    "authorization_servers": [],
+    "scopes_supported": [],
+    "bearer_methods_supported": ["header"],
+}
 
 
 def run_nlm(args):
@@ -114,9 +122,9 @@ def call_tool(name, arguments):
     return {"error": f"Outil inconnu: {name}"}
 
 
-def json_resp(handler, data):
+def json_resp(handler, data, status=200):
     body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-    handler.send_response(200)
+    handler.send_response(status)
     handler.send_header("Content-Type", "application/json")
     handler.send_header("Content-Length", str(len(body)))
     handler.send_header("Access-Control-Allow-Origin", "*")
@@ -138,6 +146,16 @@ class MCPHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        # Routes OAuth discovery - Perplexity les sonde systematiquement
+        if self.path in (
+            "/.well-known/oauth-protected-resource",
+            "/mcp/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-authorization-server",
+            "/mcp/.well-known/oauth-authorization-server",
+        ):
+            json_resp(self, WELL_KNOWN_OAUTH)
+            return
+
         if self.path in ("/mcp", "/mcp/sse", "/sse", "/"):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -153,15 +171,16 @@ class MCPHandler(BaseHTTPRequestHandler):
             self.wfile.write(f"data: {msg}\n\n".encode("utf-8"))
             self.wfile.flush()
         elif self.path == "/health":
-            json_resp(self, {"ok": True, "server": "notebooklm-mcp", "version": "2.0.0"})
+            json_resp(self, {"ok": True, "server": "notebooklm-mcp", "version": "3.0.0"})
         else:
+            print(f"[MCP] GET 404: {self.path}", flush=True)
             self.send_response(404)
             self.end_headers()
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
-        print(f"[MCP] POST: {body[:300]}", flush=True)
+        print(f"[MCP] POST {self.path}: {body[:300]}", flush=True)
         try:
             msg = json.loads(body)
         except Exception:
@@ -170,12 +189,12 @@ class MCPHandler(BaseHTTPRequestHandler):
             return
 
         method = msg.get("method", "")
-        req_id = msg.get("id")  # None pour les notifications
+        req_id = msg.get("id")
         params = msg.get("params") or {}
 
-        # Notifications (id=None ou method=notifications/*) : repondre 202, pas de body
+        # Notifications (id=None ou method=notifications/*) : HTTP 202 sans body
         if req_id is None or method.startswith("notifications/"):
-            print(f"[MCP] Notification: {method}", flush=True)
+            print(f"[MCP] Notification ignoree: {method}", flush=True)
             self.send_response(202)
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
@@ -188,7 +207,7 @@ class MCPHandler(BaseHTTPRequestHandler):
                 "result": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": {"name": "notebooklm-mcp", "version": "2.0.0"},
+                    "serverInfo": {"name": "notebooklm-mcp", "version": "3.0.0"},
                     "instructions": "Serveur MCP NotebookLM. Outils: list_notebooks, create_notebook, add_source_to_notebook.",
                 },
             }
@@ -219,7 +238,7 @@ class MCPHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"Serveur MCP NotebookLM v2 sur http://{HOST}:{PORT}/mcp", flush=True)
+    print(f"Serveur MCP NotebookLM v3 sur http://{HOST}:{PORT}/mcp", flush=True)
     print("Outils : list_notebooks, create_notebook, add_source_to_notebook", flush=True)
     print("Ctrl+C pour arreter.", flush=True)
     HTTPServer((HOST, PORT), MCPHandler).serve_forever()
