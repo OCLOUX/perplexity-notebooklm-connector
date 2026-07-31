@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 """
-Serveur MCP HTTP pour NotebookLM - Compatible Perplexity Desktop v8.1
+Serveur MCP HTTP pour NotebookLM - Compatible Perplexity Desktop v8.2
 Spec MCP 2025-06-18 / JSON-RPC 2.0 / HTTP 1.1
-- HOST force sur 127.0.0.1 (evite ERR_NGROK_8012 / conflit IPv6)
-- DELETE /mcp supporte (fermeture de session)
-- Sessions gerees en memoire
+- ThreadingHTTPServer : gestion simultanee de plusieurs requetes ngrok
+- SO_REUSEADDR/SO_REUSEPORT pour relance rapide
+- Timeouts socket pour eviter les connexions bloquantes
+- DELETE /mcp supporte
 - ConnectionAbortedError silencieux
 """
 import json
 import os
 import re
+import socket
 import subprocess
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 
 PORT = int(os.environ.get("MCP_PORT", 3000))
-# CRITIQUE : forcer 127.0.0.1 et non 0.0.0.0 pour eviter que ngrok
-# tente de se connecter via IPv6 [::1] et echoue avec ERR_NGROK_8012
 HOST = os.environ.get("MCP_HOST", "127.0.0.1")
 PROTOCOL_VERSION = "2025-06-18"
 
@@ -67,10 +68,24 @@ WELL_KNOWN_OAUTH = {
 
 SERVER_INFO = {
     "name": "notebooklm-mcp",
-    "version": "8.1.0",
+    "version": "8.2.0",
     "description": "Serveur MCP NotebookLM pour Perplexity Desktop",
     "tools": [t["name"] for t in TOOLS],
 }
+
+
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    """HTTPServer multi-thread pour gerer les requetes ngrok simultanees."""
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def server_bind(self):
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except (AttributeError, OSError):
+            pass  # SO_REUSEPORT non disponible sur Windows
+        super().server_bind()
 
 
 def run_nlm(args):
@@ -152,7 +167,7 @@ def send_json(handler, data, status=200, extra_headers=None):
         handler.end_headers()
         handler.wfile.write(body)
         handler.wfile.flush()
-    except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError):
+    except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError, OSError):
         pass
 
 
@@ -167,12 +182,13 @@ def send_sse(handler):
         msg = json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
         handler.wfile.write(f"data: {msg}\n\n".encode("utf-8"))
         handler.wfile.flush()
-    except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError):
+    except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError, OSError):
         pass
 
 
 class MCPHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    timeout = 30  # evite les connexions qui restent bloquees
 
     def log_message(self, fmt, *args):
         print(f"[MCP] {self.address_string()} {fmt % args}", flush=True)
@@ -186,7 +202,7 @@ class MCPHandler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Expose-Headers", "Mcp-Session-Id")
             self.send_header("Content-Length", "0")
             self.end_headers()
-        except (ConnectionAbortedError, BrokenPipeError):
+        except (ConnectionAbortedError, BrokenPipeError, OSError):
             pass
 
     def do_DELETE(self):
@@ -199,7 +215,7 @@ class MCPHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-        except (ConnectionAbortedError, BrokenPipeError):
+        except (ConnectionAbortedError, BrokenPipeError, OSError):
             pass
 
     def do_GET(self):
@@ -224,7 +240,7 @@ class MCPHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/health":
-            send_json(self, {"ok": True, "server": "notebooklm-mcp", "version": "8.1.0"})
+            send_json(self, {"ok": True, "server": "notebooklm-mcp", "version": "8.2.0"})
             return
 
         try:
@@ -233,13 +249,19 @@ class MCPHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        except (ConnectionAbortedError, BrokenPipeError):
+        except (ConnectionAbortedError, BrokenPipeError, OSError):
             pass
 
     def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        raw = self.rfile.read(length)
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length)
+        except OSError as e:
+            print(f"[MCP] read error: {e}", flush=True)
+            return
+
         print(f"[MCP] POST {self.path}: {raw[:400]}", flush=True)
+
         try:
             msg = json.loads(raw)
         except Exception:
@@ -249,7 +271,7 @@ class MCPHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(err)))
                 self.end_headers()
                 self.wfile.write(err)
-            except (ConnectionAbortedError, BrokenPipeError):
+            except (ConnectionAbortedError, BrokenPipeError, OSError):
                 pass
             return
 
@@ -265,7 +287,7 @@ class MCPHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", "0")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
-            except (ConnectionAbortedError, BrokenPipeError):
+            except (ConnectionAbortedError, BrokenPipeError, OSError):
                 pass
             return
 
@@ -282,7 +304,7 @@ class MCPHandler(BaseHTTPRequestHandler):
                         "tools": {"listChanged": False},
                         "logging": {},
                     },
-                    "serverInfo": {"name": "notebooklm-mcp", "version": "8.1.0"},
+                    "serverInfo": {"name": "notebooklm-mcp", "version": "8.2.0"},
                     "instructions": "Outils: list_notebooks, create_notebook, add_source_to_notebook.",
                 },
             }
@@ -314,8 +336,9 @@ class MCPHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"Serveur MCP NotebookLM v8.1 sur http://{HOST}:{PORT}/mcp", flush=True)
-    print(f"Protocole : {PROTOCOL_VERSION} / HTTP/1.1", flush=True)
+    server = ThreadingHTTPServer((HOST, PORT), MCPHandler)
+    print(f"Serveur MCP NotebookLM v8.2 sur http://{HOST}:{PORT}/mcp", flush=True)
+    print(f"Protocole : {PROTOCOL_VERSION} / HTTP/1.1 / Threading", flush=True)
     print("Outils : list_notebooks, create_notebook, add_source_to_notebook", flush=True)
     print("Ctrl+C pour arreter.", flush=True)
-    HTTPServer((HOST, PORT), MCPHandler).serve_forever()
+    server.serve_forever()
