@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Serveur MCP HTTP pour NotebookLM - Compatible Perplexity Desktop v8
+Serveur MCP HTTP pour NotebookLM - Compatible Perplexity Desktop v8.1
 Spec MCP 2025-06-18 / JSON-RPC 2.0 / HTTP 1.1
+- HOST force sur 127.0.0.1 (evite ERR_NGROK_8012 / conflit IPv6)
 - DELETE /mcp supporte (fermeture de session)
 - Sessions gerees en memoire
 - ConnectionAbortedError silencieux
@@ -14,7 +15,9 @@ import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 PORT = int(os.environ.get("MCP_PORT", 3000))
-HOST = os.environ.get("MCP_HOST", "0.0.0.0")
+# CRITIQUE : forcer 127.0.0.1 et non 0.0.0.0 pour eviter que ngrok
+# tente de se connecter via IPv6 [::1] et echoue avec ERR_NGROK_8012
+HOST = os.environ.get("MCP_HOST", "127.0.0.1")
 PROTOCOL_VERSION = "2025-06-18"
 
 SESSIONS = {}
@@ -64,7 +67,7 @@ WELL_KNOWN_OAUTH = {
 
 SERVER_INFO = {
     "name": "notebooklm-mcp",
-    "version": "8.0.0",
+    "version": "8.1.0",
     "description": "Serveur MCP NotebookLM pour Perplexity Desktop",
     "tools": [t["name"] for t in TOOLS],
 }
@@ -221,7 +224,7 @@ class MCPHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/health":
-            send_json(self, {"ok": True, "server": "notebooklm-mcp", "version": "8.0.0"})
+            send_json(self, {"ok": True, "server": "notebooklm-mcp", "version": "8.1.0"})
             return
 
         try:
@@ -279,7 +282,7 @@ class MCPHandler(BaseHTTPRequestHandler):
                         "tools": {"listChanged": False},
                         "logging": {},
                     },
-                    "serverInfo": {"name": "notebooklm-mcp", "version": "8.0.0"},
+                    "serverInfo": {"name": "notebooklm-mcp", "version": "8.1.0"},
                     "instructions": "Outils: list_notebooks, create_notebook, add_source_to_notebook.",
                 },
             }
@@ -311,7 +314,7 @@ class MCPHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"Serveur MCP NotebookLM v8 sur http://{HOST}:{PORT}/mcp", flush=True)
+    print(f"Serveur MCP NotebookLM v8.1 sur http://{HOST}:{PORT}/mcp", flush=True)
     print(f"Protocole : {PROTOCOL_VERSION} / HTTP/1.1", flush=True)
     print("Outils : list_notebooks, create_notebook, add_source_to_notebook", flush=True)
     print("Ctrl+C pour arreter.", flush=True)
