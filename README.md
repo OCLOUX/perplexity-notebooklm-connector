@@ -1,5 +1,5 @@
 # Connecteur Perplexity → NotebookLM
-
+NE PAS UTILISER : EN COURS DE TEST
 Connecteur Python Windows pour créer un notebook **NotebookLM** et y injecter une réponse **Perplexity** via le CLI `nlm`.
 
 ## Prérequis
