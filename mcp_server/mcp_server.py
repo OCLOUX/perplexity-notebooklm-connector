@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Serveur MCP HTTP pour NotebookLM - Compatible Perplexity Desktop
+Serveur MCP HTTP pour NotebookLM - Compatible Perplexity Desktop v4
 Spec MCP 2024-11-05 / JSON-RPC 2.0 strict
-Inclut les routes OAuth discovery requises par Perplexity Desktop
+- GET /mcp : JSON si sondage, SSE si Accept: text/event-stream
+- Routes OAuth discovery incluses
 """
 import json
 import os
@@ -27,7 +28,7 @@ TOOLS = [
             "properties": {
                 "title": {"type": "string", "description": "Titre du notebook"},
                 "text": {"type": "string", "description": "Contenu texte a injecter comme source"},
-                "source_title": {"type": "string", "description": "Titre de la source (defaut: Perplexity import)"},
+                "source_title": {"type": "string", "description": "Titre de la source"},
                 "urls": {"type": "array", "items": {"type": "string"}, "description": "URLs supplementaires"},
             },
             "required": ["title", "text"],
@@ -54,6 +55,13 @@ WELL_KNOWN_OAUTH = {
     "authorization_servers": [],
     "scopes_supported": [],
     "bearer_methods_supported": ["header"],
+}
+
+SERVER_INFO = {
+    "name": "notebooklm-mcp",
+    "version": "4.0.0",
+    "description": "Serveur MCP NotebookLM pour Perplexity Desktop",
+    "tools": [t["name"] for t in TOOLS],
 }
 
 
@@ -88,7 +96,6 @@ def call_tool(name, arguments):
             return json.loads(result["stdout"])
         except Exception:
             return {"raw": result["stdout"]}
-
     elif name == "create_notebook":
         title = arguments.get("title", "Notebook Perplexity")
         text = arguments.get("text", "")
@@ -107,7 +114,6 @@ def call_tool(name, arguments):
             "notebook_id": notebook_id,
             "notebook_url": f"https://notebooklm.google.com/notebook/{notebook_id}",
         }
-
     elif name == "add_source_to_notebook":
         notebook_id = arguments.get("notebook_id")
         source_title = arguments.get("source_title", "Source import")
@@ -118,7 +124,6 @@ def call_tool(name, arguments):
         else:
             return {"error": "Fournissez text ou url."}
         return {"ok": r["returncode"] == 0, "stdout": r["stdout"], "stderr": r["stderr"]}
-
     return {"error": f"Outil inconnu: {name}"}
 
 
@@ -134,6 +139,18 @@ def json_resp(handler, data, status=200):
     handler.wfile.write(body)
 
 
+def sse_resp(handler):
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/event-stream")
+    handler.send_header("Cache-Control", "no-cache")
+    handler.send_header("Connection", "keep-alive")
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.end_headers()
+    msg = json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+    handler.wfile.write(f"data: {msg}\n\n".encode("utf-8"))
+    handler.wfile.flush()
+
+
 class MCPHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print(f"[MCP] {self.address_string()} {fmt % args}", flush=True)
@@ -146,8 +163,12 @@ class MCPHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        # Routes OAuth discovery - Perplexity les sonde systematiquement
-        if self.path in (
+        path = self.path.split("?")[0]  # ignorer query string
+        accept = self.headers.get("Accept", "")
+        print(f"[MCP] GET {path} Accept={accept}", flush=True)
+
+        # Routes OAuth discovery
+        if path in (
             "/.well-known/oauth-protected-resource",
             "/mcp/.well-known/oauth-protected-resource",
             "/.well-known/oauth-authorization-server",
@@ -156,26 +177,23 @@ class MCPHandler(BaseHTTPRequestHandler):
             json_resp(self, WELL_KNOWN_OAUTH)
             return
 
-        if self.path in ("/mcp", "/mcp/sse", "/sse", "/"):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            msg = json.dumps({
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized",
-                "params": {}
-            })
-            self.wfile.write(f"data: {msg}\n\n".encode("utf-8"))
-            self.wfile.flush()
-        elif self.path == "/health":
-            json_resp(self, {"ok": True, "server": "notebooklm-mcp", "version": "3.0.0"})
-        else:
-            print(f"[MCP] GET 404: {self.path}", flush=True)
-            self.send_response(404)
-            self.end_headers()
+        # Endpoint MCP principal
+        if path in ("/mcp", "/mcp/sse", "/sse", "/"):
+            # Si le client demande explicitement SSE -> streaming
+            if "text/event-stream" in accept:
+                sse_resp(self)
+            else:
+                # Sinon sondage de validation -> JSON
+                json_resp(self, SERVER_INFO)
+            return
+
+        if path == "/health":
+            json_resp(self, {"ok": True, "server": "notebooklm-mcp", "version": "4.0.0"})
+            return
+
+        print(f"[MCP] GET 404: {path}", flush=True)
+        self.send_response(404)
+        self.end_headers()
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -192,9 +210,9 @@ class MCPHandler(BaseHTTPRequestHandler):
         req_id = msg.get("id")
         params = msg.get("params") or {}
 
-        # Notifications (id=None ou method=notifications/*) : HTTP 202 sans body
+        # Notifications -> HTTP 202 sans body
         if req_id is None or method.startswith("notifications/"):
-            print(f"[MCP] Notification ignoree: {method}", flush=True)
+            print(f"[MCP] Notification: {method}", flush=True)
             self.send_response(202)
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
@@ -202,13 +220,12 @@ class MCPHandler(BaseHTTPRequestHandler):
 
         if method == "initialize":
             resp = {
-                "jsonrpc": "2.0",
-                "id": req_id,
+                "jsonrpc": "2.0", "id": req_id,
                 "result": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": {"name": "notebooklm-mcp", "version": "3.0.0"},
-                    "instructions": "Serveur MCP NotebookLM. Outils: list_notebooks, create_notebook, add_source_to_notebook.",
+                    "serverInfo": {"name": "notebooklm-mcp", "version": "4.0.0"},
+                    "instructions": "Outils disponibles: list_notebooks, create_notebook, add_source_to_notebook.",
                 },
             }
         elif method == "tools/list":
@@ -218,8 +235,7 @@ class MCPHandler(BaseHTTPRequestHandler):
             arguments = params.get("arguments") or {}
             result = call_tool(tool_name, arguments)
             resp = {
-                "jsonrpc": "2.0",
-                "id": req_id,
+                "jsonrpc": "2.0", "id": req_id,
                 "result": {
                     "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}],
                     "isError": "error" in result,
@@ -229,8 +245,7 @@ class MCPHandler(BaseHTTPRequestHandler):
             resp = {"jsonrpc": "2.0", "id": req_id, "result": {}}
         else:
             resp = {
-                "jsonrpc": "2.0",
-                "id": req_id,
+                "jsonrpc": "2.0", "id": req_id,
                 "error": {"code": -32601, "message": f"Method not found: {method}"},
             }
 
@@ -238,7 +253,7 @@ class MCPHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"Serveur MCP NotebookLM v3 sur http://{HOST}:{PORT}/mcp", flush=True)
+    print(f"Serveur MCP NotebookLM v4 sur http://{HOST}:{PORT}/mcp", flush=True)
     print("Outils : list_notebooks, create_notebook, add_source_to_notebook", flush=True)
     print("Ctrl+C pour arreter.", flush=True)
     HTTPServer((HOST, PORT), MCPHandler).serve_forever()
