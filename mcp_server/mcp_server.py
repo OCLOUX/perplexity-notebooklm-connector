@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Serveur MCP HTTP pour NotebookLM - Compatible Perplexity Desktop v5
-Spec MCP 2025-06-18 / JSON-RPC 2.0 strict
+Serveur MCP HTTP pour NotebookLM - Compatible Perplexity Desktop v6
+Spec MCP 2025-06-18 / JSON-RPC 2.0 strict / HTTP 1.1
 """
 import json
 import os
@@ -58,7 +58,7 @@ WELL_KNOWN_OAUTH = {
 
 SERVER_INFO = {
     "name": "notebooklm-mcp",
-    "version": "5.0.0",
+    "version": "6.0.0",
     "description": "Serveur MCP NotebookLM pour Perplexity Desktop",
     "tools": [t["name"] for t in TOOLS],
 }
@@ -131,6 +131,7 @@ def json_resp(handler, data, status=200):
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json")
     handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Connection", "keep-alive")
     handler.send_header("Access-Control-Allow-Origin", "*")
     handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
     handler.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Mcp-Session-Id")
@@ -151,6 +152,9 @@ def sse_resp(handler):
 
 
 class MCPHandler(BaseHTTPRequestHandler):
+    # CRITIQUE : forcer HTTP/1.1
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, fmt, *args):
         print(f"[MCP] {self.address_string()} {fmt % args}", flush=True)
 
@@ -159,6 +163,7 @@ class MCPHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Mcp-Session-Id")
+        self.send_header("Content-Length", "0")
         self.end_headers()
 
     def do_GET(self):
@@ -183,12 +188,15 @@ class MCPHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/health":
-            json_resp(self, {"ok": True, "server": "notebooklm-mcp", "version": "5.0.0"})
+            json_resp(self, {"ok": True, "server": "notebooklm-mcp", "version": "6.0.0"})
             return
 
         print(f"[MCP] GET 404: {path}", flush=True)
+        body = b"Not Found"
         self.send_response(404)
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -197,25 +205,28 @@ class MCPHandler(BaseHTTPRequestHandler):
         try:
             msg = json.loads(body)
         except Exception:
+            body_err = b"Bad Request"
             self.send_response(400)
+            self.send_header("Content-Length", str(len(body_err)))
             self.end_headers()
+            self.wfile.write(body_err)
             return
 
         method = msg.get("method", "")
-        req_id = msg.get("id")  # peut etre 0 (entier) ou None
+        req_id = msg.get("id")  # 0 est valide, None = notification
         params = msg.get("params") or {}
 
-        # Notifications : id absent ou method notifications/*
-        # ATTENTION: id=0 est valide (entier zero), seul None est une notification
+        # Notification : id est absent (None) OU method commence par notifications/
+        # ATTENTION: id=0 (entier) est une requete valide, pas une notification
         is_notification = (req_id is None) or method.startswith("notifications/")
         if is_notification:
             print(f"[MCP] Notification: {method}", flush=True)
             self.send_response(202)
+            self.send_header("Content-Length", "0")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             return
 
-        # Echo du protocolVersion envoye par le client
         client_protocol = params.get("protocolVersion", PROTOCOL_VERSION)
 
         if method == "initialize":
@@ -227,8 +238,8 @@ class MCPHandler(BaseHTTPRequestHandler):
                         "tools": {"listChanged": False},
                         "logging": {},
                     },
-                    "serverInfo": {"name": "notebooklm-mcp", "version": "5.0.0"},
-                    "instructions": "Outils disponibles: list_notebooks, create_notebook, add_source_to_notebook.",
+                    "serverInfo": {"name": "notebooklm-mcp", "version": "6.0.0"},
+                    "instructions": "Outils: list_notebooks, create_notebook, add_source_to_notebook.",
                 },
             }
         elif method == "tools/list":
@@ -256,8 +267,8 @@ class MCPHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"Serveur MCP NotebookLM v5 sur http://{HOST}:{PORT}/mcp", flush=True)
-    print(f"Protocole : {PROTOCOL_VERSION}", flush=True)
+    print(f"Serveur MCP NotebookLM v6 sur http://{HOST}:{PORT}/mcp", flush=True)
+    print(f"Protocole : {PROTOCOL_VERSION} / HTTP 1.1", flush=True)
     print("Outils : list_notebooks, create_notebook, add_source_to_notebook", flush=True)
     print("Ctrl+C pour arreter.", flush=True)
     HTTPServer((HOST, PORT), MCPHandler).serve_forever()
